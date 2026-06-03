@@ -270,11 +270,13 @@ commit → [build] → [test] → [release] → [deploy ▶]
 
 | Stage | Job | Déclencheur | Rôle |
 |---|---|---|---|
-| **build** | `build:image` | Tout commit | Compile l'image Docker et la pousse dans le registry GitLab |
+| **build** | `build:image` | Tout commit | Compile l'image production (multi-stage) et la pousse dans le registry |
+| **build** | `build:dev` | `main` | Compile l'image de développement (`Dockerfile.dev`) et la pousse en `:dev` |
 | **test** | `test:unit` | Tout commit | PHPUnit — tests unitaires et fonctionnels (SQLite in-memory) |
 | **test** | `test:lint` | Tout commit | Laravel Pint — vérification du style de code (non bloquant) |
-| **release** | `release:image` | Branche `main` ou tag git | Confirme l'image comme `:latest`; tague aussi `v1.x.x` si tag git |
-| **deploy** | `deploy:production` | `main` — **manuel** ▶ | SSH vers le serveur, `docker pull` + redémarrage du conteneur |
+| **release** | `release:image` | `main` ou tag git | Confirme l'image comme `:latest` ; tague aussi `v1.x.x` si tag git |
+| **deploy** | `deploy:staging` | `main` — **automatique** | Déploie en mode développement : `APP_DEBUG=true`, Mailpit, port 8001 |
+| **deploy** | `deploy:production` | `main` — **manuel** ▶ | Déploie l'image prod optimisée, port 8000 |
 
 ### Prérequis GitLab
 
@@ -286,11 +288,21 @@ Dans le projet GitLab → **Settings → General → Visibility** → activer *C
 
 Dans **Settings → CI/CD → Variables**, ajouter :
 
+**Production :**
+
 | Variable | Type | Description |
 |---|---|---|
 | `SSH_PRIVATE_KEY` | File / Masked | Clé SSH privée pour accéder au serveur de prod |
 | `DEPLOY_HOST` | Variable | IP ou domaine du serveur (ex. `192.168.1.10`) |
 | `DEPLOY_USER` | Variable | Utilisateur SSH sur le serveur (ex. `ubuntu`) |
+
+**Staging / développement :**
+
+| Variable | Type | Description |
+|---|---|---|
+| `STAGING_SSH_KEY` | File / Masked | Clé SSH privée pour accéder au serveur de staging |
+| `STAGING_HOST` | Variable | IP ou domaine du serveur de staging |
+| `STAGING_USER` | Variable | Utilisateur SSH sur le serveur de staging |
 
 > `CI_REGISTRY`, `CI_REGISTRY_USER` et `CI_REGISTRY_PASSWORD` sont fournis automatiquement par GitLab.
 
@@ -333,7 +345,18 @@ Ne s'exécute que sur `main` (ou sur un tag git) **et** uniquement si `build:ima
 
 #### Stage 4 — deploy
 
-Déclenchement **manuel** depuis l'interface GitLab (bouton ▶).
+Deux jobs s'exécutent séquentiellement après `release:image` :
+
+**`deploy:staging`** — déclenchement **automatique** sur `main`
+
+Déploie l'image production avec la configuration de développement sur le serveur de staging :
+
+1. Crée un réseau Docker isolé `euphrate_staging`
+2. Démarre un conteneur **Mailpit** (capture d'e-mails, UI sur `:8025`)
+3. Lance l'application sur le port **8001** avec `APP_DEBUG=true`, `APP_ENV=local` et le mailer pointé sur Mailpit
+4. Permet de valider chaque merge avant de pousser en production
+
+**`deploy:production`** — déclenchement **manuel** ▶ depuis l'interface GitLab
 
 1. Se connecte au serveur via SSH
 2. `docker pull registry.../euphrate-laravel:latest`
@@ -343,6 +366,14 @@ Déclenchement **manuel** depuis l'interface GitLab (bouton ▶).
 
 ### Déclencher un déploiement
 
+**Staging** (automatique après chaque push sur `main`) :
+```
+GitLab → CI/CD → Pipelines → voir le job "deploy:staging" passer au vert
+  → Application disponible sur http://STAGING_HOST:8001
+  → Mailpit sur http://STAGING_HOST:8025
+```
+
+**Production** (manuel) :
 ```
 GitLab → CI/CD → Pipelines → dernier pipeline sur main
   → Stage "deploy" → cliquer ▶ sur "deploy:production"

@@ -2,9 +2,16 @@
 # Pipeline CI/CD — Collège Privé Euphrate
 #
 # Variables à configurer dans GitLab (Settings → CI/CD → Variables) :
+#
+#   Production :
 #   SSH_PRIVATE_KEY  — clé SSH privée pour accéder au serveur de production
 #   DEPLOY_HOST      — IP ou domaine du serveur de production
 #   DEPLOY_USER      — utilisateur SSH sur le serveur (ex. ubuntu, deploy)
+#
+#   Staging / développement :
+#   STAGING_SSH_KEY  — clé SSH privée pour accéder au serveur de staging
+#   STAGING_HOST     — IP ou domaine du serveur de staging
+#   STAGING_USER     — utilisateur SSH sur le serveur de staging
 #
 # Fournies automatiquement par GitLab :
 #   CI_REGISTRY, CI_REGISTRY_USER, CI_REGISTRY_PASSWORD, CI_REGISTRY_IMAGE
@@ -19,6 +26,7 @@ stages:
 variables:
   IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
   IMAGE_LATEST: $CI_REGISTRY_IMAGE:latest
+  IMAGE_DEV: $CI_REGISTRY_IMAGE:dev
   DOCKER_TLS_CERTDIR: "/certs"
 
 # ─── Ancre partagée : setup PHP + Composer (réutilisée dans test:*) ──────────
@@ -56,6 +64,25 @@ build:image:
     - docker push "$IMAGE_LATEST"
   rules:
     - if: $CI_COMMIT_BRANCH
+
+build:dev:
+  stage: build
+  image: docker:26
+  services:
+    - docker:26-dind
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - |
+      docker build \
+        --cache-from "$IMAGE_DEV" \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        -f Dockerfile.dev \
+        -t "$IMAGE_DEV" \
+        .
+    - docker push "$IMAGE_DEV"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STAGE 2 — TEST
@@ -115,11 +142,82 @@ release:image:
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STAGE 4 — DEPLOY
-# Déploiement SSH sur le serveur de production.
-# Déclenchement MANUEL pour éviter tout déploiement accidentel.
-# L'image :latest est tirée depuis le registry et relancée via docker run.
-# La clé APP_KEY et les données SQLite survivent grâce aux volumes Docker.
+#
+# deploy:staging    — automatique sur main, reflète l'environnement de dev
+#                     (APP_DEBUG=true, Mailpit, réseau Docker isolé, port 8001)
+#
+# deploy:production — manuel ▶, image optimisée prod, port 8000
 # ═══════════════════════════════════════════════════════════════════════════════
+deploy:staging:
+  stage: deploy
+  image: alpine:3.19
+  needs:
+    - job: release:image
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$STAGING_SSH_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan -H "$STAGING_HOST" >> ~/.ssh/known_hosts
+  script:
+    - |
+      cat > /tmp/staging.sh << EOF
+      #!/bin/sh
+      set -e
+      docker login -u "${CI_REGISTRY_USER}" -p "${CI_REGISTRY_PASSWORD}" "${CI_REGISTRY}"
+
+      # Réseau isolé pour que l'app joigne Mailpit par nom de conteneur
+      docker network create euphrate_staging 2>/dev/null || true
+
+      # Arrêter les anciens conteneurs
+      docker stop euphrate_staging_app euphrate_staging_mailpit 2>/dev/null || true
+      docker rm   euphrate_staging_app euphrate_staging_mailpit 2>/dev/null || true
+
+      # Mailpit — capture d'e-mails (UI sur :8025)
+      docker run -d \
+        --name euphrate_staging_mailpit \
+        --network euphrate_staging \
+        --restart unless-stopped \
+        -p 8025:8025 \
+        axllent/mailpit:latest
+
+      # Application en mode développement (APP_DEBUG=true, logs verbeux)
+      docker pull "${IMAGE_LATEST}"
+      docker run -d \
+        --name euphrate_staging_app \
+        --network euphrate_staging \
+        --restart unless-stopped \
+        -p 8001:80 \
+        -e APP_NAME="Collège Privé Euphrate [STAGING]" \
+        -e APP_ENV=local \
+        -e APP_DEBUG=true \
+        -e APP_URL="http://${STAGING_HOST}:8001" \
+        -e LOG_CHANNEL=stderr \
+        -e DB_CONNECTION=sqlite \
+        -e SESSION_DRIVER=file \
+        -e CACHE_STORE=file \
+        -e QUEUE_CONNECTION=sync \
+        -e MAIL_MAILER=smtp \
+        -e MAIL_HOST=euphrate_staging_mailpit \
+        -e MAIL_PORT=1025 \
+        -v euphrate_staging_storage:/var/www/html/storage \
+        -v euphrate_staging_sqlite:/var/www/html/database \
+        "${IMAGE_LATEST}"
+
+      docker image prune -f
+      echo "Staging déployé : ${IMAGE_LATEST}"
+      EOF
+      scp /tmp/staging.sh "${STAGING_USER}@${STAGING_HOST}:/tmp/staging_euphrate.sh"
+      ssh "${STAGING_USER}@${STAGING_HOST}" "chmod +x /tmp/staging_euphrate.sh && /tmp/staging_euphrate.sh && rm /tmp/staging_euphrate.sh"
+  environment:
+    name: staging
+    url: http://$STAGING_HOST:8001
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: on_success
+
 deploy:production:
   stage: deploy
   image: alpine:3.19
