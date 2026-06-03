@@ -1,0 +1,171 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Pipeline CI/CD — Collège Privé Euphrate
+#
+# Variables à configurer dans GitLab (Settings → CI/CD → Variables) :
+#   SSH_PRIVATE_KEY  — clé SSH privée pour accéder au serveur de production
+#   DEPLOY_HOST      — IP ou domaine du serveur de production
+#   DEPLOY_USER      — utilisateur SSH sur le serveur (ex. ubuntu, deploy)
+#
+# Fournies automatiquement par GitLab :
+#   CI_REGISTRY, CI_REGISTRY_USER, CI_REGISTRY_PASSWORD, CI_REGISTRY_IMAGE
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+stages:
+  - build
+  - test
+  - release
+  - deploy
+
+variables:
+  IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  IMAGE_LATEST: $CI_REGISTRY_IMAGE:latest
+  DOCKER_TLS_CERTDIR: "/certs"
+
+# ─── Ancre partagée : setup PHP + Composer (réutilisée dans test:*) ──────────
+.php_setup:
+  image: php:8.4-cli-alpine
+  before_script:
+    - apk add --no-cache git zip unzip sqlite-dev oniguruma-dev libzip-dev $PHPIZE_DEPS
+    - docker-php-ext-install pdo pdo_sqlite mbstring zip bcmath
+    - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+    - cp .env.example .env
+    - composer install --no-interaction --prefer-dist
+    - php artisan key:generate --force
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STAGE 1 — BUILD
+# Compile l'image Docker multi-stage et la pousse dans le registry GitLab.
+# Le cache --cache-from accélère les rebuilds successifs.
+# ═══════════════════════════════════════════════════════════════════════════════
+build:image:
+  stage: build
+  image: docker:26
+  services:
+    - docker:26-dind
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - |
+      docker build \
+        --cache-from "$IMAGE_LATEST" \
+        --build-arg BUILDKIT_INLINE_CACHE=1 \
+        -t "$IMAGE" \
+        -t "$IMAGE_LATEST" \
+        .
+    - docker push "$IMAGE"
+    - docker push "$IMAGE_LATEST"
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STAGE 2 — TEST
+# test:unit  — PHPUnit avec SQLite in-memory (parallèle avec test:lint)
+# test:lint  — Laravel Pint (style de code, non bloquant)
+# ═══════════════════════════════════════════════════════════════════════════════
+test:unit:
+  stage: test
+  extends: .php_setup
+  script:
+    - php artisan test --no-coverage
+  artifacts:
+    when: on_failure
+    paths:
+      - storage/logs/
+    expire_in: 1 week
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+test:lint:
+  stage: test
+  extends: .php_setup
+  script:
+    - ./vendor/bin/pint --test
+  allow_failure: true
+  rules:
+    - if: $CI_COMMIT_BRANCH
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STAGE 3 — RELEASE
+# Tague l'image SHA comme :latest sur la branche principale.
+# Si un tag git est posé (ex. v1.2.0), tague aussi avec ce numéro de version.
+# Ne se lance que si build ET tests unitaires sont verts.
+# ═══════════════════════════════════════════════════════════════════════════════
+release:image:
+  stage: release
+  image: docker:26
+  services:
+    - docker:26-dind
+  needs:
+    - job: build:image
+    - job: test:unit
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - docker pull "$IMAGE"
+    - docker tag "$IMAGE" "$IMAGE_LATEST"
+    - docker push "$IMAGE_LATEST"
+    - |
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        docker tag "$IMAGE" "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
+        docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
+      fi
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STAGE 4 — DEPLOY
+# Déploiement SSH sur le serveur de production.
+# Déclenchement MANUEL pour éviter tout déploiement accidentel.
+# L'image :latest est tirée depuis le registry et relancée via docker run.
+# La clé APP_KEY et les données SQLite survivent grâce aux volumes Docker.
+# ═══════════════════════════════════════════════════════════════════════════════
+deploy:production:
+  stage: deploy
+  image: alpine:3.19
+  needs:
+    - job: release:image
+  variables:
+    GIT_STRATEGY: none
+  before_script:
+    - apk add --no-cache openssh-client
+    - eval $(ssh-agent -s)
+    - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+    - mkdir -p ~/.ssh && chmod 700 ~/.ssh
+    - ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+  script:
+    - |
+      cat > /tmp/deploy.sh << EOF
+      #!/bin/sh
+      set -e
+      docker login -u "${CI_REGISTRY_USER}" -p "${CI_REGISTRY_PASSWORD}" "${CI_REGISTRY}"
+      docker pull "${IMAGE_LATEST}"
+      docker stop euphrate_app 2>/dev/null || true
+      docker rm   euphrate_app 2>/dev/null || true
+      docker run -d \\
+        --name euphrate_app \\
+        --restart unless-stopped \\
+        -p 8000:80 \\
+        -e APP_NAME="Collège Privé Euphrate" \\
+        -e APP_ENV=production \\
+        -e APP_DEBUG=false \\
+        -e APP_URL="http://${DEPLOY_HOST}" \\
+        -e LOG_CHANNEL=stderr \\
+        -e DB_CONNECTION=sqlite \\
+        -e SESSION_DRIVER=file \\
+        -e CACHE_STORE=file \\
+        -e QUEUE_CONNECTION=sync \\
+        -v euphrate_storage:/var/www/html/storage \\
+        -v euphrate_sqlite:/var/www/html/database \\
+        "${IMAGE_LATEST}"
+      docker image prune -f
+      echo "Déploiement terminé : ${IMAGE_LATEST}"
+      EOF
+      scp /tmp/deploy.sh "${DEPLOY_USER}@${DEPLOY_HOST}:/tmp/deploy_euphrate.sh"
+      ssh "${DEPLOY_USER}@${DEPLOY_HOST}" "chmod +x /tmp/deploy_euphrate.sh && /tmp/deploy_euphrate.sh && rm /tmp/deploy_euphrate.sh"
+  environment:
+    name: production
+    url: http://$DEPLOY_HOST
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
