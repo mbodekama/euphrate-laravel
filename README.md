@@ -163,6 +163,101 @@ Stage 2 — app (php:8.4-fpm-alpine)
 
 ---
 
+## Développement local avec Docker
+
+L'environnement de développement monte le code source en live et ajoute Xdebug, le hot reload Vite et la capture d'e-mails via Mailpit.
+
+### Démarrage
+
+```bash
+docker compose -f docker-compose.dev.yml up -d
+```
+
+Le premier démarrage installe `composer` (avec les dépendances dev) et `npm` à l'intérieur des conteneurs — comptez ~2 min. Les suivants démarrent en quelques secondes.
+
+### Services disponibles
+
+| Service | URL | Rôle |
+|---|---|---|
+| Application | http://localhost:8000 | PHP-FPM + Nginx, rechargement immédiat des modifications PHP |
+| Vite HMR | http://localhost:5173 | Hot reload CSS/JS sans refresh du navigateur |
+| Mailpit | http://localhost:8025 | Capture tous les e-mails envoyés par Laravel |
+
+### Ce que fait le conteneur au démarrage
+
+1. Recrée les sous-dossiers `storage/` (vidés par le volume au 1er lancement)
+2. Crée `.env` depuis `.env.example` s'il n'existe pas
+3. Génère `APP_KEY` si absent
+4. Installe les dépendances Composer **avec** `--dev` (PHPUnit, Pint, Collision…)
+5. Lance `php artisan migrate --force`
+6. **Vide** les caches (`config:clear`, `route:clear`, `view:clear`) — pas de cache en dev
+7. Démarre Nginx + PHP-FPM via Supervisord
+
+### Commandes utiles
+
+```bash
+# Voir les logs en temps réel
+docker compose -f docker-compose.dev.yml logs -f
+
+# Shell dans le conteneur PHP
+docker compose -f docker-compose.dev.yml exec app sh
+
+# Commandes artisan
+docker compose -f docker-compose.dev.yml exec app php artisan migrate:fresh --seed
+docker compose -f docker-compose.dev.yml exec app php artisan tinker
+
+# Lancer les tests
+docker compose -f docker-compose.dev.yml exec app php artisan test
+
+# Vérifier le style de code
+docker compose -f docker-compose.dev.yml exec app ./vendor/bin/pint
+
+# Arrêter les conteneurs
+docker compose -f docker-compose.dev.yml down
+
+# Réinitialisation complète (supprime vendor, node_modules, SQLite)
+docker compose -f docker-compose.dev.yml down -v
+```
+
+### Xdebug
+
+Xdebug 3 est préinstallé dans l'image dev et se connecte automatiquement à l'IDE sur `localhost:9003`.
+
+**VS Code** — installer l'extension [PHP Debug](https://marketplace.visualstudio.com/items?itemName=xdebug.php-debug), puis ajouter dans `.vscode/launch.json` :
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Listen for Xdebug (Docker)",
+      "type": "php",
+      "request": "launch",
+      "port": 9003,
+      "pathMappings": {
+        "/var/www/html": "${workspaceFolder}"
+      }
+    }
+  ]
+}
+```
+
+**PhpStorm** — `Settings → PHP → Debug` : port `9003`, puis `Settings → PHP → Servers` : ajouter un serveur `localhost:8000` avec le path mapping `/var/www/html` → racine du projet.
+
+### Différences avec l'environnement de production
+
+| | Production (`docker-compose.yml`) | Développement (`docker-compose.dev.yml`) |
+|---|---|---|
+| Code source | Copié dans l'image au build | Monté en volume (live reload) |
+| Dépendances Composer | Sans `--dev` | Avec `--dev` |
+| Assets | Compilés au build (`npm run build`) | Servis par Vite en HMR |
+| Cache config/routes | Activé | Désactivé |
+| Xdebug | Non | Oui (port 9003) |
+| E-mails | Configuré manuellement | Capturés par Mailpit |
+| `APP_DEBUG` | `false` | `true` |
+
+---
+
 ## Pipeline CI/CD (GitLab)
 
 Le fichier `.gitlab-ci.yml` définit un pipeline automatisé en **4 stages** :
@@ -288,9 +383,16 @@ public/
 routes/
 └── web.php                  — Toutes les routes nommées
 docker/
-├── entrypoint.sh            — Script de démarrage du conteneur
+├── entrypoint.sh            — Entrypoint production (cache config, clé persistée)
+├── entrypoint.dev.sh        — Entrypoint développement (composer --dev, pas de cache)
 ├── nginx/default.conf       — Config Nginx
-└── supervisord.conf         — Config Supervisord (Nginx + PHP-FPM)
+├── supervisord.conf         — Config Supervisord (Nginx + PHP-FPM)
+├── xdebug.ini               — Config Xdebug (host-gateway:9003)
+└── php-fpm.conf             — Pool FPM : clear_env=no (vars Docker visibles en PHP)
+Dockerfile                   — Image production (multi-stage, assets compilés)
+Dockerfile.dev               — Image développement (Xdebug, code monté via volume)
+docker-compose.yml           — Stack production (port 8000)
+docker-compose.dev.yml       — Stack développement (app + Vite + Mailpit)
 ```
 
 ---
