@@ -1,0 +1,70 @@
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# Environnement de développement local
+#
+# Démarrage :
+#   docker compose -f docker-compose.dev.yml up -d
+#
+# Services exposés :
+#   http://localhost:8000  — Application Laravel (PHP-FPM + Nginx)
+#   http://localhost:5173  — Vite HMR (hot reload des assets)
+#   http://localhost:8025  — Mailpit (capture des e-mails)
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+services:
+
+  # ─── PHP 8.4 + Nginx + Xdebug ──────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - .:/var/www/html                         # Code source monté en live
+      - vendor_dev:/var/www/html/vendor          # Vendor isolé (binaires natifs)
+      - storage_dev:/var/www/html/storage
+      - sqlite_dev:/var/www/html/database
+    ports:
+      - "8000:80"
+    environment:
+      APP_NAME: "Collège Privé Euphrate"
+      APP_ENV: local
+      APP_DEBUG: "true"
+      APP_URL: http://localhost:8000
+      LOG_CHANNEL: stderr
+      DB_CONNECTION: sqlite
+      SESSION_DRIVER: file
+      CACHE_STORE: file
+      QUEUE_CONNECTION: sync
+      MAIL_MAILER: smtp
+      MAIL_HOST: mailpit
+      MAIL_PORT: "1025"
+      MAIL_FROM_ADDRESS: "dev@euphrate.local"
+    depends_on:
+      - mailpit
+    restart: unless-stopped
+
+  # ─── Vite — hot reload des assets ──────────────────────────────────────────
+  vite:
+    image: node:22-alpine
+    working_dir: /app
+    volumes:
+      - .:/app
+      - node_modules_dev:/app/node_modules      # node_modules isolé (binaires natifs)
+    ports:
+      - "5173:5173"
+    command: sh -c "npm install && npm run dev"
+    restart: unless-stopped
+
+  # ─── Mailpit — capture d'e-mails de développement ──────────────────────────
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "8025:8025"                             # Interface web
+    environment:
+      MP_MAX_MESSAGES: "500"
+    restart: unless-stopped
+
+volumes:
+  vendor_dev:
+  node_modules_dev:
+  storage_dev:
+  sqlite_dev:
